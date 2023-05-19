@@ -2,6 +2,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from einops.layers.torch import Rearrange
+from diffusers.models.unet_2d_blocks import CrossAttnDownBlock2D, CrossAttnUpBlock2D
+
 
 
 class PositionalEncoding(nn.Module):
@@ -80,6 +82,8 @@ class TemporalAttentionLayer(nn.Module):
         self.alpha = nn.Parameter(torch.ones(1))
 
     def forward(self, q, kv=None, mask=None):
+        skip = q
+
         kv = kv if kv is not None else q
 
         bt, c, h, w = q.shape
@@ -95,10 +99,78 @@ class TemporalAttentionLayer(nn.Module):
         out = self.o_proj(out)
 
         out = rearrange('(b h w) t c -> (b t) c h w', h=h, w=w)
+
+        with torch.no_grad():
+            self.alpha.clamp_(0, 1)
+
+        out = self.alpha * skip + (1 - self.alpha) * out
         return out
+
+
+class DownBlock(CrossAttnDownBlock2D):
+    def __init__(self, *args, n_frames=8, n_heads=8, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        in_channels = kwargs['in_channels']
+        out_channels = kwargs['out_channels']
+        num_layers = kwargs['num_layers']
+
+        conv3ds = []
+        tempo_attns = []
+
+        for i in range(kwargs['num_layers']):
+            in_channels = in_channels if i == 0 else out_channels
+
+            conv3ds.append(
+                Conv3DLayer(
+                    in_dim=in_channels,
+                    out_dim=out_channels,
+                    n_frames=n_frames,
+                )
+            )
+
+            tempo_attns.append(
+                TemporalAttentionLayer(
+                    dim=out_channels,
+                    n_frames=n_frames,
+                    n_heads=n_heads,
+                )
+            )
+
+        self.conv3ds = nn.ModuleList(conv3ds)
+        self.tempo_attns = nn.ModuleList(tempo_attns)
+
+    def forward(
+        self, hidden_states, temb=None, encoder_hidden_states=None, attention_mask=None, cross_attention_kwargs=None
+    ):
+        output_states = ()
+
+        for resnet, conv3d, attn, tempo_attn in zip(self.resnets, self.conv3ds, self.attentions, self.tempo_attns):
+
+            hidden_states = resnet(hidden_states, temb)
+            hidden_states = conv3d(hidden_states)
+            hidden_states = attn(
+                hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                cross_attention_kwargs=cross_attention_kwargs,
+            ).sample
+            hidden_states = tempo_attn(
+                hidden_states,
+                encoder_hidden_states,
+            )
+
+            output_states += (hidden_states,)
+
+        if self.downsamplers is not None:
+            for downsampler in self.downsamplers:
+                hidden_states = downsampler(hidden_states)
+
+            output_states += (hidden_states,)
+
+        return hidden_states, output_states
 
 
 class VideoLDM(UNet2DConditionModel):
     def __init__(self, *args, **kwargs):
-        pass
+
 
