@@ -1,8 +1,14 @@
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from einops.layers.torch import Rearrange
-from diffusers.models.unet_2d_blocks import DownBlock2D, UpBlock2D
+from diffusers.models.unet_2d_blocks import (
+    CrossAttnDownBlock2D,
+    CrossAttnUpBlock2D,
+    DownBlock2D,
+    UpBlock2D
+)
 
 
 def get_down_block(
@@ -41,7 +47,7 @@ def get_down_block(
             downsample_padding=downsample_padding,
             resnet_time_scale_shift=resnet_time_scale_shift,
         )
-    elif down_block_type == "VideoLDMDownBlock":
+    elif down_block_type == "CrossAttnDownBlock2D":
         return VideoLDMDownBlock(
             num_layers=num_layers,
             in_channels=in_channels,
@@ -100,7 +106,7 @@ def get_up_block(
             resnet_groups=resnet_groups,
             resnet_time_scale_shift=resnet_time_scale_shift,
         )
-    elif up_block_type == 'VideoLDMUpBlock':
+    elif up_block_type == 'CrossAttnUpBlock2D':
         return VideoLDMUpBlock(
             num_layers=num_layers,
             in_channels=in_channels,
