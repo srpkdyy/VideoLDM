@@ -1,3 +1,5 @@
+from typing import Optional, Dict, Tuple, Any
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -189,17 +191,20 @@ class Conv3DLayer(nn.Module):
 
 
 class TemporalAttentionLayer(nn.Module):
-    def __init__(self, dim, n_frames, n_heads=8):
+    def __init__(self, dim, n_frames, n_heads=8, kv_dim=None):
         super().__init__()
         self.n_frames = n_frames
+        self.n_heads = n_heads
 
         self.pos_enc = PositionalEncoding(dim)
 
         head_dim = dim // n_heads
         proj_dim = head_dim * n_heads
         self.q_proj = nn.Linear(dim, proj_dim, bias=False)
-        self.k_proj = nn.Linear(dim, proj_dim, bias=False)
-        self.v_proj = nn.Linear(dim, proj_dim, bias=False)
+
+        kv_dim = kv_dim or dim
+        self.k_proj = nn.Linear(kv_dim, proj_dim, bias=False)
+        self.v_proj = nn.Linear(kv_dim, proj_dim, bias=False)
         self.o_proj = nn.Linear(proj_dim, dim, bias=False)
 
         self.alpha = nn.Parameter(torch.ones(1))
@@ -207,21 +212,25 @@ class TemporalAttentionLayer(nn.Module):
     def forward(self, q, kv=None, mask=None):
         skip = q
 
-        kv = kv if kv is not None else q
-
         bt, c, h, w = q.shape
-        q = rearrange(q, '(b t) c h w -> (b h w) t c', t=self.n_frames)
+        q = rearrange(q, '(b t) c h w -> b (h w) t c', t=self.n_frames)
 
         q = q + self.pos_enc(self.n_frames)
 
-        qkv = torch.stack([self.q_proj(q), self.k_proj(kv), self.v_proj(kv)])
-        q, k, v = rearrange(qkv, 'qkv bhw t (h d) -> qkv bhw h t d', h=self.n_heads)
+        kv = kv[::self.n_frames] if kv is not None else q
+        q = self.q_proj(q)
+        k = self.k_proj(kv)
+        v = self.v_proj(kv)
+
+        q = rearrange(q, 'b hw t (heads d) -> b hw heads t d', heads=self.n_heads)
+        k = rearrange(k, 'b s (heads d) -> b heads s d', heads=self.n_heads)
+        v = rearrange(v, 'b s (heads d) -> b heads s d', heads=self.n_heads)
 
         out = F.scaled_dot_product_attention(q, k, v, mask)
-        out = rearrange(out, 'bhw h t d -> bhw t (h d)')
+        out = rearrange(out, 'b hw heads t d -> b hw t (heads d)')
         out = self.o_proj(out)
 
-        out = rearrange('(b h w) t c -> (b t) c h w', h=h, w=w)
+        out = rearrange(out, 'b (h w) t c -> (b t) c h w', h=h, w=w)
 
         with torch.no_grad():
             self.alpha.clamp_(0, 1)
@@ -231,22 +240,20 @@ class TemporalAttentionLayer(nn.Module):
 
 
 class VideoLDMDownBlock(CrossAttnDownBlock2D):
-    def __init__(self, *args, n_frames=8, n_heads=8, **kwargs):
+    def __init__(self, *args, n_frames=8, n_temp_heads=8, **kwargs):
         super().__init__(*args, **kwargs)
 
-        in_channels = kwargs['in_channels']
         out_channels = kwargs['out_channels']
         num_layers = kwargs['num_layers']
+        cross_attn_dim = kwargs.get('cross_attention_dim')
 
         conv3ds = []
         tempo_attns = []
 
         for i in range(kwargs['num_layers']):
-            in_channels = in_channels if i == 0 else out_channels
-
             conv3ds.append(
                 Conv3DLayer(
-                    in_dim=in_channels,
+                    in_dim=out_channels,
                     out_dim=out_channels,
                     n_frames=n_frames,
                 )
@@ -256,7 +263,8 @@ class VideoLDMDownBlock(CrossAttnDownBlock2D):
                 TemporalAttentionLayer(
                     dim=out_channels,
                     n_frames=n_frames,
-                    n_heads=n_heads,
+                    n_heads=n_temp_heads,
+                    kv_dim=cross_attn_dim,
                 )
             )
 
@@ -264,7 +272,13 @@ class VideoLDMDownBlock(CrossAttnDownBlock2D):
         self.tempo_attns = nn.ModuleList(tempo_attns)
 
     def forward(
-        self, hidden_states, temb=None, encoder_hidden_states=None, attention_mask=None, cross_attention_kwargs=None
+        self,
+        hidden_states: torch.FloatTensor,
+        temb: Optional[torch.FloatTensor] = None,
+        encoder_hidden_states: Optional[torch.FloatTensor] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        cross_attention_kwargs: Optional[Dict[str, Any]] = None,
+        encoder_attention_mask: Optional[torch.FloatTensor] = None,
     ):
         output_states = ()
 
@@ -294,24 +308,20 @@ class VideoLDMDownBlock(CrossAttnDownBlock2D):
 
 
 class VideoLDMUpBlock(CrossAttnUpBlock2D):
-    def __init__(self, *args, n_frames=8, n_heads=8, **kwargs):
+    def __init__(self, *args, n_frames=8, n_temp_heads=8, **kwargs):
         super().__init__(*args, **kwargs)
 
-        in_channels = kwargs['in_channels']
         out_channels = kwargs['out_channels']
-        prev_output_channel = kwargs['prev_output_channel']
         num_layers = kwargs['num_layers']
+        cross_attn_dim = kwargs.get('cross_attention_dim')
 
         conv3ds = []
         tempo_attns = []
 
         for i in range(kwargs['num_layers']):
-            res_skip_channels = in_channels if (i == num_layers - 1) else out_channels
-            resnet_in_channels = prev_output_channel if i == 0 else out_channels
-
             conv3ds.append(
                 Conv3DLayer(
-                    in_dim=resnet_in_channels + res_skip_channels,
+                    in_dim=out_channels,
                     out_dim=out_channels,
                     n_frames=n_frames,
                 )
@@ -321,7 +331,8 @@ class VideoLDMUpBlock(CrossAttnUpBlock2D):
                 TemporalAttentionLayer(
                     dim=out_channels,
                     n_frames=n_frames,
-                    n_heads=n_heads,
+                    n_heads=n_temp_heads,
+                    kv_dim=cross_attn_dim
                 )
             )
 
@@ -330,13 +341,14 @@ class VideoLDMUpBlock(CrossAttnUpBlock2D):
 
     def forward(
         self,
-        hidden_states,
-        res_hidden_states_tuple,
-        temb=None,
-        encoder_hidden_states=None,
-        cross_attention_kwargs=None,
-        upsample_size=None,
-        attention_mask=None,
+        hidden_states: torch.FloatTensor,
+        res_hidden_states_tuple: Tuple[torch.FloatTensor, ...],
+        temb: Optional[torch.FloatTensor] = None,
+        encoder_hidden_states: Optional[torch.FloatTensor] = None,
+        cross_attention_kwargs: Optional[Dict[str, Any]] = None,
+        upsample_size: Optional[int] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        encoder_attention_mask: Optional[torch.FloatTensor] = None,
     ):
         for resnet, conv3d, attn, tempo_attn in zip(self.resnets, self.conv3ds, self.attentions, self.tempo_attns):
 
