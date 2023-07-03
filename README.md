@@ -1,6 +1,6 @@
 # Video LDM
 
-![model](https://d3i71xaburhd42.cloudfront.net/f5a0c57f90c6abe31482e9f320ccac5ee789b135/4-Figure4-1.png)
+![model](assets/4-Figure4-1.png)
 
 ## Overview
 
